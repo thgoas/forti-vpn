@@ -10,11 +10,12 @@ services:
       - /dev/ppp
     env_file: .env
     networks:
-      - abys_net
+      abys_net:
+        ipv4_address: 172.21.0.10   # IP fixo, estável
 
 networks:
-  # Shared network created elsewhere (e.g. the API stack):
-  #   docker network create abys_net
+  # Shared network created elsewhere with a defined subnet, e.g.:
+  #   docker network create --subnet 172.21.0.0/16 abys_net
   abys_net:
     external: true
     name: abys_net
