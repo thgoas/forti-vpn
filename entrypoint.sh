@@ -31,6 +31,12 @@ PING_TARGET="${PING_TARGET:-}"
 PING_INTERVAL="${PING_INTERVAL:-30}"
 RECONNECT_WAIT="${RECONNECT_WAIT:-5}"
 
+# Space-separated list of TCP forwards exposed to other containers, each in the
+# form LOCAL_PORT:REMOTE_HOST:REMOTE_PORT (e.g. "5432:10.20.0.15:5432"). socat
+# listens on 0.0.0.0 so containers sharing this container's network can reach a
+# service that only exists on the far side of the tunnel.
+FORWARDS="${FORWARDS:-}"
+
 if [ -z "$VPN_HOST" ] || [ -z "$VPN_USER" ] || [ -z "$VPN_PASS" ]; then
   log "ERROR: VPN_HOST, VPN_USER and VPN_PASS are required"
   exit 1
@@ -55,6 +61,7 @@ fi
 NUM_HOSTS=${#HOSTS[@]}
 ACTIVE=0
 VPN_PID=""
+SOCAT_PIDS=()
 
 # --- Functions --------------------------------------------------------------
 start_vpn() {
@@ -102,6 +109,38 @@ stop_vpn() {
   VPN_PID=""
 }
 
+# --- TCP forwards (socat) ---------------------------------------------------
+# The socat listeners must be recreated on every (re)connect: the listening
+# socket survives, but restarting keeps things clean and drops connections that
+# were pinned to the old ppp0.
+start_forwards() {
+  [ -z "$FORWARDS" ] && return 0
+  local fwd lport rest rhost rport
+  for fwd in $FORWARDS; do
+    lport="${fwd%%:*}"
+    rest="${fwd#*:}"
+    rhost="${rest%%:*}"
+    rport="${rest##*:}"
+    log "Forward: 0.0.0.0:${lport} -> ${rhost}:${rport} (via ppp0)"
+    socat "TCP-LISTEN:${lport},fork,reuseaddr" "TCP:${rhost}:${rport}" &
+    SOCAT_PIDS+=("$!")
+  done
+}
+
+stop_forwards() {
+  [ "${#SOCAT_PIDS[@]}" -eq 0 ] && return 0
+  local pid
+  for pid in "${SOCAT_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null
+  done
+  SOCAT_PIDS=()
+}
+
+restart_forwards() {
+  stop_forwards
+  start_forwards
+}
+
 switch_host() {
   ACTIVE=$(( (ACTIVE + 1) % NUM_HOSTS ))
 }
@@ -114,6 +153,7 @@ connect() {
     start_vpn
     if wait_for_tunnel; then
       log "Tunnel is up on ${HOSTS[$ACTIVE]} (ppp0)"
+      restart_forwards
       return 0
     fi
 
@@ -131,7 +171,7 @@ connect() {
 }
 
 # Clean shutdown on container stop
-trap 'log "Received termination signal, shutting down"; stop_vpn; exit 0' TERM INT
+trap 'log "Received termination signal, shutting down"; stop_forwards; stop_vpn; exit 0' TERM INT
 
 # --- Initial connection -----------------------------------------------------
 if [ "$NUM_HOSTS" -gt 1 ]; then
