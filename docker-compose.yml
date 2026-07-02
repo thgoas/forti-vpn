@@ -1,0 +1,11 @@
+services:
+  forticlient-vpn:
+    build: .
+    container_name: forti-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+      - /dev/ppp
+    env_file: .env
