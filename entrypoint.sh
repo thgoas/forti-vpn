@@ -15,9 +15,18 @@ fi
 # --- Environment variables --------------------------------------------------
 VPN_HOST="${VPN_HOST:-}"
 VPN_PORT="${VPN_PORT:-443}"
+VPN_TRUSTED_CERT="${VPN_TRUSTED_CERT:-}"
+
+# Optional secondary gateway for failover. Port/cert fall back to the primary's
+# values when their *2 counterparts are empty.
+VPN_HOST2="${VPN_HOST2:-}"
+VPN_PORT2="${VPN_PORT2:-$VPN_PORT}"
+VPN_TRUSTED_CERT2="${VPN_TRUSTED_CERT2:-}"
+
+# Same credentials are used for both gateways.
 VPN_USER="${VPN_USER:-}"
 VPN_PASS="${VPN_PASS:-}"
-VPN_TRUSTED_CERT="${VPN_TRUSTED_CERT:-}"
+
 PING_TARGET="${PING_TARGET:-}"
 PING_INTERVAL="${PING_INTERVAL:-30}"
 RECONNECT_WAIT="${RECONNECT_WAIT:-5}"
@@ -32,18 +41,35 @@ if [ -z "$PING_TARGET" ]; then
   exit 1
 fi
 
+# --- Gateway list (primary first, secondary appended when configured) -------
+HOSTS=("$VPN_HOST")
+PORTS=("$VPN_PORT")
+CERTS=("$VPN_TRUSTED_CERT")
+
+if [ -n "$VPN_HOST2" ]; then
+  HOSTS+=("$VPN_HOST2")
+  PORTS+=("$VPN_PORT2")
+  CERTS+=("$VPN_TRUSTED_CERT2")
+fi
+
+NUM_HOSTS=${#HOSTS[@]}
+ACTIVE=0
 VPN_PID=""
 
 # --- Functions --------------------------------------------------------------
 start_vpn() {
-  log "Starting openfortivpn against ${VPN_HOST}:${VPN_PORT} as ${VPN_USER}"
+  local host="${HOSTS[$ACTIVE]}"
+  local port="${PORTS[$ACTIVE]}"
+  local cert="${CERTS[$ACTIVE]}"
 
-  set -- "${VPN_HOST}:${VPN_PORT}" \
+  log "Starting openfortivpn against ${host}:${port} as ${VPN_USER}"
+
+  set -- "${host}:${port}" \
     --username="${VPN_USER}" \
     --password="${VPN_PASS}"
 
-  if [ -n "$VPN_TRUSTED_CERT" ]; then
-    set -- "$@" --trusted-cert "${VPN_TRUSTED_CERT}"
+  if [ -n "$cert" ]; then
+    set -- "$@" --trusted-cert "${cert}"
   fi
 
   openfortivpn "$@" &
@@ -76,17 +102,46 @@ stop_vpn() {
   VPN_PID=""
 }
 
+switch_host() {
+  ACTIVE=$(( (ACTIVE + 1) % NUM_HOSTS ))
+}
+
+# Try to bring the tunnel up, failing over across all configured gateways.
+# Starts from the currently active host and rotates through the rest.
+connect() {
+  local tries=0
+  while [ "$tries" -lt "$NUM_HOSTS" ]; do
+    start_vpn
+    if wait_for_tunnel; then
+      log "Tunnel is up on ${HOSTS[$ACTIVE]} (ppp0)"
+      return 0
+    fi
+
+    log "Gateway ${HOSTS[$ACTIVE]} did not come up within 20s"
+    stop_vpn
+    tries=$((tries + 1))
+
+    if [ "$NUM_HOSTS" -gt 1 ] && [ "$tries" -lt "$NUM_HOSTS" ]; then
+      switch_host
+      log "Failing over to ${HOSTS[$ACTIVE]}"
+      sleep "$RECONNECT_WAIT"
+    fi
+  done
+  return 1
+}
+
 # Clean shutdown on container stop
 trap 'log "Received termination signal, shutting down"; stop_vpn; exit 0' TERM INT
 
 # --- Initial connection -----------------------------------------------------
-start_vpn
-
-if wait_for_tunnel; then
-  log "Tunnel is up (ppp0)"
+if [ "$NUM_HOSTS" -gt 1 ]; then
+  log "Configured gateways: ${HOSTS[*]} (failover enabled)"
 else
-  log "ERROR: tunnel did not come up within 20s"
-  stop_vpn
+  log "Configured gateway: ${HOSTS[0]}"
+fi
+
+if ! connect; then
+  log "ERROR: no gateway came up (tried: ${HOSTS[*]})"
   exit 1
 fi
 
@@ -106,16 +161,16 @@ while true; do
   fi
 
   if [ "$healthy" = false ]; then
-    log "Tunnel unhealthy, reconnecting"
+    log "Tunnel unhealthy on ${HOSTS[$ACTIVE]}, reconnecting"
     stop_vpn
     log "Waiting ${RECONNECT_WAIT}s before reconnect"
     sleep "$RECONNECT_WAIT"
-    start_vpn
 
-    if wait_for_tunnel; then
-      log "Tunnel is back up (ppp0)"
+    # connect() retries the current gateway first, then fails over to the other.
+    if connect; then
+      log "Tunnel restored"
     else
-      log "WARNING: tunnel did not come back up within 20s, will retry next cycle"
+      log "WARNING: no gateway came up, will retry next cycle"
     fi
   fi
 done
