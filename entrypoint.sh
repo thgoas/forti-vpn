@@ -31,11 +31,11 @@ PING_TARGET="${PING_TARGET:-}"
 PING_INTERVAL="${PING_INTERVAL:-30}"
 RECONNECT_WAIT="${RECONNECT_WAIT:-5}"
 
-# Space-separated list of TCP forwards exposed to other containers, each in the
-# form LOCAL_PORT:REMOTE_HOST:REMOTE_PORT (e.g. "5432:10.20.0.15:5432"). socat
-# listens on 0.0.0.0 so containers sharing this container's network can reach a
-# service that only exists on the far side of the tunnel.
-FORWARDS="${FORWARDS:-}"
+# When true, act as a gateway: enable IPv4 forwarding + MASQUERADE on ppp0 so
+# other containers can reach the tunnel's networks by their real IPs. They must
+# route to those networks via this container's IP, e.g. on the peer container:
+#   ip route add 172.16.1.0/24 via 172.21.0.10
+NAT_ENABLED="${NAT_ENABLED:-true}"
 
 if [ -z "$VPN_HOST" ] || [ -z "$VPN_USER" ] || [ -z "$VPN_PASS" ]; then
   log "ERROR: VPN_HOST, VPN_USER and VPN_PASS are required"
@@ -61,7 +61,6 @@ fi
 NUM_HOSTS=${#HOSTS[@]}
 ACTIVE=0
 VPN_PID=""
-SOCAT_PIDS=()
 
 # --- Functions --------------------------------------------------------------
 start_vpn() {
@@ -109,36 +108,19 @@ stop_vpn() {
   VPN_PID=""
 }
 
-# --- TCP forwards (socat) ---------------------------------------------------
-# The socat listeners must be recreated on every (re)connect: the listening
-# socket survives, but restarting keeps things clean and drops connections that
-# were pinned to the old ppp0.
-start_forwards() {
-  [ -z "$FORWARDS" ] && return 0
-  local fwd lport rest rhost rport
-  for fwd in $FORWARDS; do
-    lport="${fwd%%:*}"
-    rest="${fwd#*:}"
-    rhost="${rest%%:*}"
-    rport="${rest##*:}"
-    log "Forward: 0.0.0.0:${lport} -> ${rhost}:${rport} (via ppp0)"
-    socat "TCP-LISTEN:${lport},fork,reuseaddr" "TCP:${rhost}:${rport}" &
-    SOCAT_PIDS+=("$!")
-  done
-}
-
-stop_forwards() {
-  [ "${#SOCAT_PIDS[@]}" -eq 0 ] && return 0
-  local pid
-  for pid in "${SOCAT_PIDS[@]}"; do
-    kill "$pid" 2>/dev/null
-  done
-  SOCAT_PIDS=()
-}
-
-restart_forwards() {
-  stop_forwards
-  start_forwards
+# --- Gateway NAT ------------------------------------------------------------
+# Turns this container into a router for the tunnel: forwarding + source NAT on
+# ppp0 so replies to traffic from other containers find their way back.
+enable_nat() {
+  [ "$NAT_ENABLED" = "true" ] || return 0
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 \
+    || echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+  # The rule matches by interface name, so it survives ppp0 being recreated on
+  # reconnect; -C keeps the add idempotent.
+  if ! iptables -t nat -C POSTROUTING -o ppp0 -j MASQUERADE 2>/dev/null; then
+    iptables -t nat -A POSTROUTING -o ppp0 -j MASQUERADE
+  fi
+  log "Gateway NAT enabled (ip_forward=1, MASQUERADE on ppp0)"
 }
 
 switch_host() {
@@ -153,7 +135,7 @@ connect() {
     start_vpn
     if wait_for_tunnel; then
       log "Tunnel is up on ${HOSTS[$ACTIVE]} (ppp0)"
-      restart_forwards
+      enable_nat
       return 0
     fi
 
@@ -171,7 +153,7 @@ connect() {
 }
 
 # Clean shutdown on container stop
-trap 'log "Received termination signal, shutting down"; stop_forwards; stop_vpn; exit 0' TERM INT
+trap 'log "Received termination signal, shutting down"; stop_vpn; exit 0' TERM INT
 
 # --- Initial connection -----------------------------------------------------
 if [ "$NUM_HOSTS" -gt 1 ]; then
