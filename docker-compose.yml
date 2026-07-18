@@ -5,9 +5,10 @@ services:
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
-    devices:
-      - /dev/net/tun
-      - /dev/ppp
+    sysctls:
+      # Enable IPv4 forwarding at container start so the gateway NAT works
+      # without writing to a read-only /proc/sys at runtime.
+      - net.ipv4.ip_forward=1
     env_file: .env
     networks:
       abys_net:
