@@ -43,6 +43,11 @@ PING_TARGET="${PING_TARGET:-}"
 PING_INTERVAL="${PING_INTERVAL:-30}"
 RECONNECT_WAIT="${RECONNECT_WAIT:-5}"
 
+# Consecutive failed ping checks tolerated before tearing the tunnel down. A
+# single blip (or a PING_TARGET that momentarily doesn't answer) should not
+# trigger a reconnect; the SA going down still reconnects immediately.
+HEALTH_FAIL_LIMIT="${HEALTH_FAIL_LIMIT:-3}"
+
 # When true, act as a gateway: enable IPv4 forwarding and SNAT other containers'
 # traffic to the tunnel's virtual IP so it matches the IPsec policy (policy-based
 # IPsec only routes traffic sourced from the mode-config virtual IP). Peer
@@ -72,8 +77,12 @@ ACTIVE=0
 
 # Mode-config virtual IP of the current tunnel. Locally-generated traffic (the
 # watchdog ping) must be sourced from it, since the IPsec policy only covers the
-# virtual IP — the container's own eth0 address is not tunnelled.
+# virtual IP — the container's own eth0 address is not tunnelled. We assign it to
+# a local interface (see setup_vip_iface) so it is a usable source and so
+# decapsulated replies to it are delivered; PREV_VIP tracks the last one to
+# remove on reconnect (the FortiGate may hand out a different IP each time).
 VIRTUAL_IP=""
+PREV_VIP=""
 
 # --- strongSwan configuration -----------------------------------------------
 # ipsec.secrets holds the PSK and the XAUTH password; regenerated once (the
@@ -138,6 +147,25 @@ stop_vpn() {
   ipsec down "$CONN" >/dev/null 2>&1
 }
 
+# Assign the mode-config virtual IP to the container's primary interface as a
+# /32. strongSwan does not reliably install it inside a container, and without a
+# local copy of the address (a) `ping -I <vip>` fails to bind ("Cannot assign
+# requested address") so the watchdog can never verify the tunnel, and (b)
+# decapsulated replies destined to the virtual IP are dropped. The peer SNAT path
+# does not need this, but the watchdog does.
+setup_vip_iface() {
+  [ -n "$VIRTUAL_IP" ] || return 0
+  local dev
+  dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+  dev="${dev:-eth0}"
+
+  if [ -n "$PREV_VIP" ] && [ "$PREV_VIP" != "$VIRTUAL_IP" ]; then
+    ip addr del "${PREV_VIP}/32" dev "$dev" 2>/dev/null
+  fi
+  ip addr replace "${VIRTUAL_IP}/32" dev "$dev"
+  PREV_VIP="$VIRTUAL_IP"
+}
+
 # --- Gateway NAT ------------------------------------------------------------
 # SNAT other containers' traffic to the tunnel's virtual IP (dynamic, so the
 # rule is refreshed on every (re)connect). The old rule is removed first to stay
@@ -199,6 +227,7 @@ connect() {
     if is_tunnel_up; then
       VIRTUAL_IP=$(get_virtual_ip)
       log "Tunnel is up on ${host} (IPsec SA INSTALLED, virtual IP ${VIRTUAL_IP:-unknown})"
+      setup_vip_iface
       enable_nat
       return 0
     fi
@@ -245,23 +274,26 @@ if ! connect; then
 fi
 
 # --- Watchdog loop ----------------------------------------------------------
-log "Watchdog started (interval=${PING_INTERVAL}s, target=${PING_TARGET})"
+log "Watchdog started (interval=${PING_INTERVAL}s, target=${PING_TARGET}, fail_limit=${HEALTH_FAIL_LIMIT})"
+fails=0
 while true; do
   sleep "$PING_INTERVAL"
 
-  healthy=true
-
-  # The ping must be sourced from the virtual IP, otherwise it leaves via eth0
-  # unencrypted (outside the IPsec policy) and always fails.
+  # The ping is sourced from the virtual IP (assigned to the interface by
+  # setup_vip_iface); otherwise it leaves unencrypted, outside the IPsec policy.
   if ! is_tunnel_up; then
+    # A dropped SA is unambiguous — reconnect without waiting for the threshold.
     log "Health check FAILED: IPsec SA is down"
-    healthy=false
+    fails="$HEALTH_FAIL_LIMIT"
   elif ! ping -c 2 -W 3 ${VIRTUAL_IP:+-I "$VIRTUAL_IP"} "$PING_TARGET" >/dev/null 2>&1; then
-    log "Health check FAILED: ping to ${PING_TARGET} failed"
-    healthy=false
+    fails=$((fails + 1))
+    log "Health check FAILED: ping to ${PING_TARGET} failed (${fails}/${HEALTH_FAIL_LIMIT})"
+  else
+    [ "$fails" -ne 0 ] && log "Health check recovered after ${fails} failure(s)"
+    fails=0
   fi
 
-  if [ "$healthy" = false ]; then
+  if [ "$fails" -ge "$HEALTH_FAIL_LIMIT" ]; then
     log "Tunnel unhealthy on ${HOSTS[$ACTIVE]}, reconnecting"
     stop_vpn
     log "Waiting ${RECONNECT_WAIT}s before reconnect"
@@ -273,5 +305,6 @@ while true; do
     else
       log "WARNING: no gateway came up, will retry next cycle"
     fi
+    fails=0
   fi
 done
