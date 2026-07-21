@@ -252,6 +252,14 @@ trap 'log "Received termination signal, shutting down"; clear_nat; ipsec stop >/
 write_secrets
 write_config "${HOSTS[0]}"
 
+# Stop strongSwan from overwriting /etc/resolv.conf with the tunnel's internal
+# DNS servers. Those cannot resolve the public gateway hostnames, so after the
+# first connect a reconnect/failover to another gateway fails with "unable to
+# resolve <gateway>". The container resolves gateways via Docker's DNS and
+# reaches internal hosts by IP, so it never needs the internal resolvers.
+mkdir -p /etc/strongswan.d/charon
+printf 'resolve {\n    load = no\n}\n' > /etc/strongswan.d/charon/resolve.conf
+
 log "Starting charon (strongSwan IKE daemon)"
 ipsec start >/dev/null 2>&1
 # Wait for the daemon's control socket before issuing commands.
