@@ -9,6 +9,15 @@ services:
       # Enable IPv4 forwarding at container start so the gateway NAT works
       # without writing to a read-only /proc/sys at runtime.
       - net.ipv4.ip_forward=1
+      # Loose reverse-path filtering (2). With strict RPF (1) the kernel drops
+      # the decapsulated replies of the peers' forwarded flows (conntrack stays
+      # [UNREPLIED]) — they come back sourced from the remote host but their
+      # reverse route is the tunnel, which strict RPF rejects. The effective
+      # value is max(all, <iface>); setting `all=2` forces loose on every
+      # interface regardless of the per-interface default. See strongSwan's
+      # Forwarding & Split-Tunneling howto.
+      - net.ipv4.conf.all.rp_filter=2
+      - net.ipv4.conf.default.rp_filter=2
     env_file: .env
     networks:
       abys_net:
