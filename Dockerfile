@@ -18,6 +18,8 @@ RUN apt-get update \
         iputils-ping \
         ca-certificates \
         iptables \
+        tcpdump \
+        conntrack \
     && rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /entrypoint.sh
