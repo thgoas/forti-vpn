@@ -282,27 +282,41 @@ if ! connect; then
 fi
 
 # --- Watchdog loop ----------------------------------------------------------
-log "Watchdog started (interval=${PING_INTERVAL}s, target=${PING_TARGET}, fail_limit=${HEALTH_FAIL_LIMIT})"
+# Authoritative health signal is the IPsec SA state. strongSwan's own DPD
+# (dpdaction=restart) already tears down and reconnects a dead gateway, so the
+# watchdog only reconnects when the SA has been down for HEALTH_FAIL_LIMIT
+# consecutive checks (a backstop for cases DPD misses). The PING_TARGET check is
+# ADVISORY by default: a ping failure is logged but does NOT reconnect, because
+# sourcing a ping from the virtual IP is fragile (interface/route/RPF details)
+# and a false negative there used to flap a perfectly healthy tunnel. Set
+# WATCHDOG_PING_RECONNECT=true to restore ping-triggered reconnects.
+WATCHDOG_PING_RECONNECT="${WATCHDOG_PING_RECONNECT:-false}"
+log "Watchdog started (interval=${PING_INTERVAL}s, target=${PING_TARGET}, fail_limit=${HEALTH_FAIL_LIMIT}, ping_reconnect=${WATCHDOG_PING_RECONNECT})"
 fails=0
 while true; do
   sleep "$PING_INTERVAL"
 
-  # The ping is sourced from the virtual IP (assigned to the interface by
-  # setup_vip_iface); otherwise it leaves unencrypted, outside the IPsec policy.
   if ! is_tunnel_up; then
-    # A dropped SA is unambiguous — reconnect without waiting for the threshold.
-    log "Health check FAILED: IPsec SA is down"
-    fails="$HEALTH_FAIL_LIMIT"
-  elif ! ping -c 2 -W 3 ${VIRTUAL_IP:+-I "$VIRTUAL_IP"} "$PING_TARGET" >/dev/null 2>&1; then
     fails=$((fails + 1))
-    log "Health check FAILED: ping to ${PING_TARGET} failed (${fails}/${HEALTH_FAIL_LIMIT})"
+    log "Health check: IPsec SA is down (${fails}/${HEALTH_FAIL_LIMIT})"
   else
     [ "$fails" -ne 0 ] && log "Health check recovered after ${fails} failure(s)"
     fails=0
+    # Advisory route check — logs a broken route to PING_TARGET without tearing
+    # the tunnel down, unless explicitly opted in.
+    if [ -n "$PING_TARGET" ] \
+       && ! ping -c 2 -W 3 ${VIRTUAL_IP:+-I "$VIRTUAL_IP"} "$PING_TARGET" >/dev/null 2>&1; then
+      if [ "$WATCHDOG_PING_RECONNECT" = "true" ]; then
+        fails="$HEALTH_FAIL_LIMIT"
+        log "Health check FAILED: ping to ${PING_TARGET} failed, reconnecting (opt-in)"
+      else
+        log "WARNING: ping to ${PING_TARGET} failed but SA is up — not reconnecting"
+      fi
+    fi
   fi
 
   if [ "$fails" -ge "$HEALTH_FAIL_LIMIT" ]; then
-    log "Tunnel unhealthy on ${HOSTS[$ACTIVE]}, reconnecting"
+    log "Tunnel down on ${HOSTS[$ACTIVE]}, reconnecting"
     stop_vpn
     log "Waiting ${RECONNECT_WAIT}s before reconnect"
     sleep "$RECONNECT_WAIT"
